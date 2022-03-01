@@ -8,6 +8,7 @@ open System.Net.Sockets
 open System.Text
 open MimeKit
 open System.Threading.Tasks
+open System.Text.RegularExpressions
 
 
 type private Agent<'T> = MailboxProcessor<'T>
@@ -81,14 +82,24 @@ module ReaderWriter =
           getAll = fun () -> agent.PostAndReply GetAll }
 
 
-let private (|DATA|QUIT|HELLO|EHLO|NOOP|) (input: string) =
+let private (|DATA|QUIT|HELLO|EHLO|NOOP|MAILFROM|RCPTTO|) (input: string) =
 
-    match input |> String.map Char.ToLower with
-    | "data" -> DATA
-    | "quit" -> QUIT
-    | "hello" -> HELLO
-    | "ehlo" -> EHLO
-    | "noop" -> NOOP
+    match input.Split [| ':' |] |> Array.toList with
+    | cmd :: [] ->
+        match cmd |> String.map Char.ToUpper with
+        | "DATA" -> DATA
+        | "QUIT" -> QUIT
+        | "HELLO" -> HELLO
+        | "EHLO" -> EHLO
+        | _ -> NOOP
+    | field :: address :: [] ->
+        match field
+              |> fun s -> s.Trim()
+              |> String.map Char.ToUpper
+            with
+        | "MAIL FROM" -> MAILFROM address
+        | "RCPT TO" -> RCPTTO address
+        | _ -> NOOP
     | _ -> NOOP
 
 let readUntilTerminator (readline: unit -> string) =
@@ -102,7 +113,6 @@ let smtp (rw: ReaderWriter.t) =
         match rw.read () with
         | DATA ->
             rw.write "354 Start input, end data with <CRLF>.<CRLF>"
-
 
             let data =
                 try
@@ -119,11 +129,15 @@ let smtp (rw: ReaderWriter.t) =
             readlines data
 
         | QUIT ->
-            rw.write "250 OK, ciao"
+            rw.write "332 OK, Servie closing the socket, ciao"
 
             match email with
-            | Some e -> Result.Ok e
-            | None -> Result.Error "[smtp] error when readingDATA section"
+            | Some e ->
+                rw.write $"250 OK, receved"
+                Result.Ok e
+            | None ->
+                rw.write $"500 Erro when reading from the DATA command"
+                Result.Error "[smtp] error when readingDATA section"
 
         | HELLO ->
             rw.write "220 HELLO there"
@@ -133,8 +147,16 @@ let smtp (rw: ReaderWriter.t) =
             rw.write "220 EHLO there"
             None |> readlines
 
-        | rest ->
-            rw.write "250 OK"
+        | MAILFROM fromAddr ->
+            rw.write $"250 OK, mail from {fromAddr}"
+            None |> readlines
+
+        | RCPTTO toAddr ->
+            rw.write $"250 OK, rcpt to {toAddr}"
+            None |> readlines
+
+        | other ->
+            rw.write $"502 Command is not implemented: {other}"
             None |> readlines
 
     readlines <| None
@@ -152,7 +174,7 @@ let emailsServer (port: int) (host: string) : Result<Email, string> seq =
             seq {
                 use client = server.AcceptTcpClient()
                 printfn $"[connected]\n"
-                let stream = client.GetStream()
+                let mutable stream = client.GetStream()
                 let rw = ReaderWriter.create stream
 
                 yield smtp rw
