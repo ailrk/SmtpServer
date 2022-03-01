@@ -9,18 +9,25 @@ module Program =
     let main _ =
         printf $"[starting mail serivce] port: {port}\n"
 
-        let onNext (email: Email) = printf $"{email} received"
-        let server = SMTP.Server.create port None
+        let onNext (mail: Email) =
+            printfn
+                $"{mail} received
+            "
 
-        server.emailReceived
-        |> Observable.subscribe onNext
+        let onError err =
+            printf $"[email] an error happened: {err}"
+
+        let onCompleted _ = ()
+
+        let server = new SMTP.Server(port)
+
+        server.EmailReceived
+        |> Observable.subscribeWithCallbacks onNext onError onCompleted
         |> ignore
 
         let rec loop () =
             Thread.Sleep 1000
             loop ()
-
         loop ()
-
 
         0
