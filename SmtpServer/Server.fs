@@ -10,9 +10,12 @@ open MimeKit
 open System.Threading.Tasks
 open System.Threading
 open System.Text.RegularExpressions
+open System.Reactive.Subjects
+open System.Reactive
+open System.Reactive.Linq
 
 
-type private Agent<'T> = MailboxProcessor<'T>
+type private Actor<'T> = MailboxProcessor<'T>
 
 
 type Email = Email of MimeMessage
@@ -47,8 +50,8 @@ module ReaderWriter =
           getAll: unit -> Message list }
 
 
-    let private createAgent (sr: StreamReader, wr: StreamWriter) =
-        Agent.Start (fun inbox ->
+    let private actor (sr: StreamReader, wr: StreamWriter) =
+        Actor.Start (fun inbox ->
             let rec loop lines =
                 async {
                     let! msg = inbox.Receive()
@@ -76,11 +79,11 @@ module ReaderWriter =
         let wr = new StreamWriter(stream)
         wr.NewLine <- "\r\n"
         wr.AutoFlush <- true
-        let agent = createAgent <| (sr, wr)
+        let actor = actor <| (sr, wr)
 
-        { read = fun () -> agent.PostAndReply Read
-          write = fun line -> agent.Post(Write line)
-          getAll = fun () -> agent.PostAndReply GetAll }
+        { read = fun () -> actor.PostAndReply Read
+          write = fun line -> actor.Post(Write line)
+          getAll = fun () -> actor.PostAndReply GetAll }
 
 
 let private (|DATA|QUIT|HELLO|EHLO|NOOP|MAILFROM|RCPTTO|) (input: string) =
@@ -109,7 +112,7 @@ let readUntilTerminator (readline: unit -> string) =
     |> Seq.takeWhile (fun line -> not (line = null || line.Trim() = "."))
 
 
-let smtp (rw: ReaderWriter.t) =
+let smtpHandler (rw: ReaderWriter.t) =
     let rec readlines email : Result<Email, string> =
         match rw.read () with
         | DATA ->
@@ -183,7 +186,7 @@ let receive (listener: TcpListener) (cancellation: CancellationToken) =
             use! client = acceptClientTask |> Async.AwaitTask
             let stream = client.GetStream()
             let rw = ReaderWriter.create stream
-            let data = smtp rw
+            let data = smtpHandler rw
             let messages = rw.getAll ()
             client.Close()
 
@@ -193,31 +196,112 @@ let receive (listener: TcpListener) (cancellation: CancellationToken) =
 
     }
 
+type public ForwardServerInfo = { Port: int; Host: string }
+
+let forward (forwardServer: ForwardServerInfo) (messages: Message list) =
+    task {
+        use client = new TcpClient()
+        let port = forwardServer.Port
+        let host = forwardServer.Host
+        do! client.ConnectAsync(IPAddress.Parse host, port)
+        use stream = client.GetStream()
+        use w = new StreamWriter(stream)
+        w.NewLine <- "\r\n"
+        w.AutoFlush <- true
+        use r = new StreamReader(stream)
 
 
+        for msg in messages do
+            match msg with
+            | Received m -> do! w.WriteLineAsync m
+            | Sent _ ->
+                do!
+                    r.ReadLineAsync()
+                    |> Async.AwaitTask
+                    |> Async.Ignore
 
-let emailsServer (port: int) (host: string) : Task<Result<Email * Message list, string>> seq =
-    let addr = IPAddress.Parse host
-    let server = new TcpListener(addr, port)
-
-    let cancellationTokenSource = new CancellationTokenSource()
+        client.Close()
+    }
 
 
-    try
+let smtpActor
+    (cacheActor: Actor<CheckInbox>)
+    (port: int)
+    (forwardServerInfo: ForwardServerInfo option)
+    (cancellation: CancellationToken)
+    =
+    Actor.Start
+    <| fun _ ->
+        let server =
+            new TcpListener(new IPEndPoint(IPAddress.Any, port))
 
         server.Start()
 
         let rec loop () =
-            seq {
-                yield receive server cancellationTokenSource.Token
-                yield! loop ()
+            task {
+                let! result = receive server cancellation |> Async.AwaitTask
+
+                match result with
+                | Result.Error _ -> server.Stop()
+                | Result.Ok (email, messages) ->
+                    email |> Add |> cacheActor.Post
+
+                    match forwardServerInfo with
+                    | Some info -> do! forward info messages
+                    | _ -> ()
+
+                if cancellation.IsCancellationRequested then
+                    server.Stop()
+                else
+                    return! loop ()
+
             }
 
-        loop ()
+        loop () |> Async.AwaitTask
 
 
-    with
-    | ex ->
-        printfn $"[emailServer] exception{ex}"
-        server.Stop()
-        Seq.empty
+
+let cacheActor emailCont =
+    Actor.Start
+    <| fun inbox ->
+        let rec loop messages =
+            async {
+
+                let! newMessage = inbox.Receive()
+
+                match newMessage with
+                | Get chan ->
+                    chan.Reply messages
+                    return! loop messages
+                | GetAndReset chan ->
+                    chan.Reply messages
+                    return! loop []
+                | Add message ->
+                    message |> emailCont
+                    return! loop (message :: messages)
+            }
+
+        loop []
+
+
+
+module Server =
+
+    type t =
+        { getEmails: bool -> Email seq
+          port: int
+          emailReceived: IObservable<Email> }
+
+    let create (port: int) (forwardServerInfo: ForwardServerInfo option) =
+        let cancellationSource = new CancellationTokenSource()
+        let emailReceived = new Subject<Email>()
+        let cache = cacheActor emailReceived.OnNext
+
+        let server =
+            smtpActor cache port forwardServerInfo cancellationSource.Token
+
+        { getEmails = fun reset -> cache.PostAndReply Get
+
+          port = port
+
+          emailReceived = emailReceived.AsObservable() }

@@ -1,4 +1,5 @@
 module Program =
+    open FSharp.Control.Reactive
     open System.Threading
     open SMTP
 
@@ -7,11 +8,19 @@ module Program =
     [<EntryPoint>]
     let main _ =
         printf $"[starting mail serivce] port: {port}\n"
-        let emails = emailsServer 8888 "127.0.0.1"
 
-        for n in emails do
-            match n with
-            | Result.Ok (Email mime) -> printfn $"mime {mime}"
-            | Result.Error err -> printf $"err {err}"
+        let onNext (email: Email) = printf $"{email} received"
+        let server = SMTP.Server.create port None
+
+        server.emailReceived
+        |> Observable.subscribe onNext
+        |> ignore
+
+        let rec loop () =
+            Thread.Sleep 1000
+            loop ()
+
+        loop ()
+
 
         0
