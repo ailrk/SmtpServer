@@ -8,6 +8,7 @@ open System.Net.Sockets
 open System.Text
 open MimeKit
 open System.Threading.Tasks
+open System.Threading
 open System.Text.RegularExpressions
 
 
@@ -161,28 +162,59 @@ let smtp (rw: ReaderWriter.t) =
 
     readlines <| None
 
-let emailsServer (port: int) (host: string) : Result<Email, string> seq =
+let receive (listener: TcpListener) (cancellation: CancellationToken) =
+    task {
+        let cancellationTask = TaskCompletionSource()
+
+        let cancellationEvent =
+            cancellation.Register(fun _ -> cancellationTask.SetCanceled())
+
+        let acceptClientTask = listener.AcceptTcpClientAsync()
+
+        do!
+            Task.WhenAll [ cancellationTask.Task
+                           acceptClientTask ]
+            |> Async.AwaitTask
+            |> Async.Ignore
+
+        if cancellationTask.Task.IsCanceled then
+            return Result.Error "recive email is canceled"
+        else
+            use! client = acceptClientTask |> Async.AwaitTask
+            let stream = client.GetStream()
+            let rw = ReaderWriter.create stream
+            let data = smtp rw
+            let messages = rw.getAll ()
+            client.Close()
+
+            return
+                data
+                |> Result.bind (fun email -> Result.Ok(email, messages))
+
+    }
+
+
+
+
+let emailsServer (port: int) (host: string) : Task<Result<Email * Message list, string>> seq =
     let addr = IPAddress.Parse host
     let server = new TcpListener(addr, port)
+
+    let cancellationTokenSource = new CancellationTokenSource()
+
 
     try
 
         server.Start()
-        let buffer = Array.create<byte> 256 0uy
 
         let rec loop () =
             seq {
-                use client = server.AcceptTcpClient()
-                printfn $"[connected]\n"
-                let mutable stream = client.GetStream()
-                let rw = ReaderWriter.create stream
-
-                yield smtp rw
-                client.Close()
+                yield receive server cancellationTokenSource.Token
                 yield! loop ()
             }
 
         loop ()
+
 
     with
     | ex ->
