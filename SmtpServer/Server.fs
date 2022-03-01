@@ -1,83 +1,51 @@
-﻿module SMTP
+module SMTP
 
-open System.Net.Sockets
-open System.Net
-open System.IO
+
 open System
-open System.Threading
-open System.Threading.Tasks
-open System.Reactive
-open System.Reactive.Subjects
-open System.Reactive.Linq
+open System.IO
+open System.Net
+open System.Net.Sockets
+open System.Text
 open MimeKit
+open System.Threading.Tasks
+
 
 type private Agent<'T> = MailboxProcessor<'T>
 
-type private Header =
-    { Subject: string option
-      From: string list
-      To: string list
-      Headers: string list }
 
-type private EMailBuilder = { Body: string list; Header: Header }
+type Email = Email of MimeMessage
 
-type EMail =
-    { Body: string seq
-      Subject: string
-      From: string seq
-      To: string seq
-      Headers: string seq }
+type EmailHandler = Email seq -> unit
 
-let private emptyHeader =
-    { Header.Subject = None
-      From = []
-      To = []
-      Headers = [] }
+type CheckInbox =
+    | Get of AsyncReplyChannel<Email seq>
+    | GetAndReset of AsyncReplyChannel<Email seq>
+    | Add of Email
 
-let private emptyEmail =
-    { EMailBuilder.Body = []
-      Header = emptyHeader }
 
-type private CheckInbox =
-    | Get of AsyncReplyChannel<EMail seq>
-    | GetAndReset of AsyncReplyChannel<EMail seq>
-    | Add of EMail
-
-let private (|From|To|Subject|Header|) (input: string) =
-    let fields = [ "From"; "To"; "Subject" ]
-    let addColon x = x |> List.map (fun x -> x + ": ")
-
-    let trimStart (x: string) =
-        input.Split([| x |], StringSplitOptions.None).[1..]
-        |> Array.fold (+) ""
-
-    let splitCsv (input: string) =
-        input.Split([| ',' |], StringSplitOptions.None)
-        |> Array.map (fun i -> i.Trim())
-        |> Array.toList
-
-    let matches =
-        fields
-        |> addColon
-        |> List.map (fun r -> (input.StartsWith(r), trimStart r))
-
-    match matches with
-    | (true, input) :: _ -> From(input |> splitCsv)
-    | _ :: (true, input) :: _ -> To(input |> splitCsv)
-    | _ :: _ :: (true, input) :: _ -> Subject input
-    | _ -> Header input
-
-type private Message =
+type Message =
     | Received of string
     | Sent of string
 
-type private ReaderLines =
+
+
+type ReaderLines =
     | Read of AsyncReplyChannel<string>
     | Write of string
     | GetAll of AsyncReplyChannel<Message list>
+    | End
 
-type private ReaderWriter(sr: StreamReader, wr: StreamWriter) =
-    let agent =
+
+module ReaderWriter =
+
+
+    type t =
+        { read: unit -> string
+          write: string -> unit
+          getAll: unit -> Message list }
+
+
+    let private createAgent (sr: StreamReader, wr: StreamWriter) =
         Agent.Start (fun inbox ->
             let rec loop lines =
                 async {
@@ -94,223 +62,108 @@ type private ReaderWriter(sr: StreamReader, wr: StreamWriter) =
                     | GetAll chan ->
                         lines |> List.rev |> chan.Reply
                         return! loop lines
+                    | End ->
+                        sr.Dispose()
+                        wr.Dispose()
                 }
 
             loop [])
 
-    member this.Read() = agent.PostAndReply Read
-    member this.Write line = agent.Post(Write line)
-    member this.GetAll() = agent.PostAndReply GetAll
+    let create (stream: Stream) : t =
+        let sr = new StreamReader(stream)
+        let wr = new StreamWriter(stream)
+        wr.NewLine <- "\r\n"
+        wr.AutoFlush <- true
+        let agent = createAgent <| (sr, wr)
 
-    interface System.IDisposable with
-        member this.Dispose() =
-            sr.Dispose()
-            wr.Dispose()
+        { read = fun () -> agent.PostAndReply Read
+          write = fun line -> agent.Post(Write line)
+          getAll = fun () -> agent.PostAndReply GetAll }
 
-let private receiveEmails (listener: TcpListener) (cancellation: CancellationToken) =
-    async {
-        let cancellationTask = TaskCompletionSource()
 
-        use cancellationEvent =
-            cancellation.Register(fun () -> cancellationTask.SetCanceled())
+let private (|DATA|QUIT|HELLO|EHLO|NOOP|) (input: string) =
 
-        let acceptClientTask = listener.AcceptTcpClientAsync()
+    match input |> String.map Char.ToLower with
+    | "data" -> DATA
+    | "quit" -> QUIT
+    | "hello" -> HELLO
+    | "ehlo" -> EHLO
+    | "noop" -> NOOP
+    | _ -> NOOP
 
-        do!
-            Task.WhenAny(
-                [ cancellationTask.Task
-                  acceptClientTask ]
-            )
-            |> Async.AwaitTask
-            |> Async.Ignore
+let readUntilTerminator (readline: unit -> string) =
+    ()
+    |> Seq.unfold (fun _ -> Some(readline (), ()))
+    |> Seq.takeWhile (fun line -> not (line = null || line.Trim() = "."))
 
-        if cancellationTask.Task.IsCanceled then
-            return None
-        else
-            use! client = acceptClientTask |> Async.AwaitTask
 
-            use stream = client.GetStream()
+let smtp (rw: ReaderWriter.t) =
+    let rec readlines email : Result<Email, string> =
+        match rw.read () with
+        | DATA ->
+            rw.write "354 Start input, end data with <CRLF>.<CRLF>"
 
-            use recorder =
-                let sr = new StreamReader(stream)
-                let wr = new StreamWriter(stream)
-                wr.NewLine <- "\r\n"
-                wr.AutoFlush <- true
-                new ReaderWriter(sr, wr)
 
-            let writeline = recorder.Write
-            let readline = recorder.Read
+            let data =
+                try
+                    readUntilTerminator rw.read
+                    |> String.concat "\r\n"
+                    |> System.Text.Encoding.ASCII.GetBytes
+                    |> fun msg -> new MemoryStream(msg)
+                    |> MimeKit.MimeMessage.Load
+                    |> Email
+                    |> Some
+                with
+                | _ -> None
 
-            writeline "220 localhost -- Fake proxy server"
+            readlines data
 
-            let rec readlines emailBuilder emails =
-                let line = readline ()
+        | QUIT ->
+            rw.write "250 OK, ciao"
 
-                match line with
-                | "DATA" ->
-                    writeline "354 Start input, end data with <CRLF>.<CRLF>"
+            match email with
+            | Some e -> Result.Ok e
+            | None -> Result.Error "[smtp] error when readingDATA section"
 
-                    let readUntilTerminator () =
-                        ()
-                        |> Seq.unfold (fun () -> Some(readline (), ()))
-                        |> Seq.takeWhile (fun line -> set [ null; "."; "" ] |> Set.contains line |> not)
+        | HELLO ->
+            rw.write "220 HELLO there"
+            None |> readlines
 
-                    let header =
-                        readUntilTerminator ()
-                        |> Seq.fold
-                            (fun header line ->
-                                let header =
-                                    { header with Header.Headers = line :: header.Headers }
+        | EHLO ->
+            rw.write "220 EHLO there"
+            None |> readlines
 
-                                let header =
-                                    match line with
-                                    | From l -> { header with From = l }
-                                    | To l -> { header with To = l }
-                                    | Subject l -> { header with Subject = Some l }
-                                    | _ -> header
+        | rest ->
+            rw.write "250 OK"
+            None |> readlines
 
-                                header)
-                            emailBuilder.Header
+    readlines <| None
 
-                    let body = readUntilTerminator () |> List.ofSeq
+let emailsServer (port: int) (host: string) : Result<Email, string> seq =
+    let addr = IPAddress.Parse host
+    let server = new TcpListener(addr, port)
 
-                    readlines
-                        emptyEmail
-                        ({ emailBuilder with
-                            Header = header
-                            Body = body }
-                         :: emails)
-                | "QUIT" ->
-                    writeline "250 OK"
-                    emails
-                | rest ->
-                    writeline "250 OK"
-                    readlines emailBuilder emails
+    try
 
-            let newMessages = readlines emptyEmail []
-            let recorded = recorder.GetAll()
-
-            client.Close()
-
-            return (newMessages, recorded) |> Some
-    }
-
-type public ForwardServerConfig = { Port: int; Host: string }
-
-let private forwardMessages forwardServer messages =
-    async {
-        use client = new TcpClient()
-
-        do!
-            client.ConnectAsync(forwardServer.Host, forwardServer.Port)
-            |> Async.AwaitIAsyncResult
-            |> Async.Ignore
-
-        use stream = client.GetStream()
-        use streamWriter = new StreamWriter(stream)
-        streamWriter.NewLine <- "\r\n"
-        streamWriter.AutoFlush <- true
-        use streamReader = new StreamReader(stream)
-
-        for message in messages do
-            match message with
-            | Received m ->
-                do!
-                    streamWriter.WriteLineAsync(m)
-                    |> Async.AwaitIAsyncResult
-                    |> Async.Ignore
-            | Sent m ->
-                do!
-                    streamReader.ReadLineAsync()
-                    |> Async.AwaitTask
-                    |> Async.Ignore
-
-        client.Close()
-    }
-
-let private smtpAgent (cachingAgent: Agent<CheckInbox>) port forwardServer (cancellation: CancellationToken) =
-    Agent.Start (fun _ ->
-        let endPoint = new IPEndPoint(IPAddress.Any, port)
-        let listener = new TcpListener(endPoint)
-        listener.Start()
+        server.Start()
+        let buffer = Array.create<byte> 256 0uy
 
         let rec loop () =
-            async {
-                let! emailResult = receiveEmails listener cancellation
+            seq {
+                use client = server.AcceptTcpClient()
+                printfn $"[connected]\n"
+                let stream = client.GetStream()
+                let rw = ReaderWriter.create stream
 
-                match emailResult with
-                | None -> listener.Stop()
-                | Some (newMessages, recorded) ->
-                    newMessages
-                    |> List.map (fun newMessage ->
-                        { From = newMessage.Header.From
-                          To = newMessage.Header.To
-                          Subject =
-                            newMessage.Header.Subject
-                            |> Option.fold (fun s t -> t) ""
-                          Body = newMessage.Body
-                          Headers = newMessage.Header.Headers }
-                        |> Add)
-                    |> List.iter cachingAgent.Post
-
-                    match forwardServer with
-                    | Some config -> do! forwardMessages config recorded
-                    | _ -> ()
-
-                if cancellation.IsCancellationRequested then
-                    listener.Stop()
-                else
-                    return! loop ()
+                yield smtp rw
+                client.Close()
+                yield! loop ()
             }
 
-        loop ())
+        loop ()
 
-let private cachingAgent emailReceived =
-    Agent.Start (fun inbox ->
-        let rec loop messages =
-            async {
-                let! newMessage = inbox.Receive()
-
-                match newMessage with
-                | Get channel ->
-                    channel.Reply messages
-                    return! loop messages
-                | GetAndReset channel ->
-                    channel.Reply messages
-                    return! loop []
-                | Add message ->
-                    message |> emailReceived
-                    return! loop (message :: messages)
-            }
-
-        loop [])
-
-let public NoForwardServer = { Port = -1; Host = "" }
-
-type public Server(port, thruServer) =
-    let cancellationSource = new CancellationTokenSource()
-    let emailReceivedEvent = new Subject<EMail>()
-    let cache = cachingAgent emailReceivedEvent.OnNext
-
-    let server =
-        smtpAgent
-            cache
-            port
-            (if thruServer = NoForwardServer then
-                 None
-             else
-                 Some thruServer)
-            cancellationSource.Token
-
-    new(port) = new Server(port, NoForwardServer)
-    new() = new Server(25, NoForwardServer)
-
-    interface IDisposable with
-        member x.Dispose() =
-            cancellationSource.Cancel(false)
-            cancellationSource.Dispose()
-
-    member this.GetEmails() = cache.PostAndReply Get
-    member this.GetEmailsAndReset() = cache.PostAndReply GetAndReset
-    member this.Port = port
-    member this.EmailReceived = emailReceivedEvent.AsObservable()
+    with
+    | ex ->
+        printfn $"[emailServer] exception{ex}"
+        server.Stop()
+        Seq.empty

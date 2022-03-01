@@ -1,0 +1,41 @@
+#!/usr/bin/expect -f
+
+# a simple telnet session to test the connectivity of the smtp server.
+
+set mimeContent [lindex $argv 0];
+set timeout -l
+
+spawn telnet localhost 8888
+sleep 0.1
+expect -re {[2]{2,}[0][1,]}
+
+send "ehlo\r"
+sleep 0.1
+expect -re {[2]{1,}[5]{1,}[0]{1,}}
+
+#
+send "MAIL FROM: foo@somedomain.com\r"
+sleep 0.1
+expect -re {[2]{1,}[5]{1,}[0]{1,}}
+
+send "RCPT TO: bar@somedomain.com\r"
+sleep 0.1
+expect -re {[2]{1,}[5]{1,}[0]{1,}}
+
+
+send "DATA\r"
+sleep 0.1
+expect -re {[3]{1,}[5]{1,}[4]{1,}}
+
+# send -- [exec cat "test/withflint-application"]
+# send -- [exec cat "test/yc-application"]
+send -- [exec cat "$mimeContent"]
+
+sleep 0.1
+
+send "\r"
+send ".\r"
+
+sleep 0.1
+send "QUIT\r"
+expect eof
