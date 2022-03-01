@@ -33,7 +33,6 @@ type ReaderLines =
     | Read of AsyncReplyChannel<string>
     | Write of string
     | GetAll of AsyncReplyChannel<Message list>
-    | End
 
 
 
@@ -56,7 +55,6 @@ let private (|DATA|QUIT|HELLO|EHLO|NOOP|MAILFROM|RCPTTO|) (input: string) =
         | "RCPT TO" -> RCPTTO address
         | _ -> NOOP
     | _ -> NOOP
-
 
 
 
@@ -86,9 +84,6 @@ module ReaderWriter =
                     | GetAll chan ->
                         lines |> List.rev |> chan.Reply
                         return! loop lines
-                    | End ->
-                        sr.Dispose()
-                        wr.Dispose()
                 }
 
             loop [])
@@ -166,37 +161,27 @@ let smtpHandler (rw: ReaderWriter.t) =
     readlines <| None
 
 
-let private receiveEmails (listener: TcpListener) (cancellation: CancellationToken) =
+let private receiveEmails (listener: TcpListener) =
     async {
-        let cancellationTask = TaskCompletionSource()
-
-        use cancellationEvent =
-            cancellation.Register(fun () -> cancellationTask.SetCanceled())
 
         let acceptClientTask = listener.AcceptTcpClientAsync()
 
         do!
-            Task.WhenAny(
-                [ cancellationTask.Task
-                  acceptClientTask ]
-            )
+            acceptClientTask
             |> Async.AwaitTask
             |> Async.Ignore
 
-        if cancellationTask.Task.IsCanceled then
-            return Result.Error "task is canceled"
-        else
-            use! client = acceptClientTask |> Async.AwaitTask
-            use stream = client.GetStream()
-            let rw = ReaderWriter.create stream
-            let data = smtpHandler rw
-            let messages = rw.getAll ()
+        use! client = acceptClientTask |> Async.AwaitTask
+        use stream = client.GetStream()
+        let rw = ReaderWriter.create stream
+        let data = smtpHandler rw
+        let messages = rw.getAll ()
 
-            client.Close()
+        client.Close()
 
-            return
-                data
-                |> Result.map (fun email -> (email, messages))
+        return
+            data
+            |> Result.map (fun email -> (email, messages))
     }
 
 type public ForwardServerConfig = { Port: int; Host: string }
@@ -205,8 +190,7 @@ let private forwardMessages forwardServer messages =
     task {
         use client = new TcpClient()
 
-        do!
-            client.ConnectAsync(forwardServer.Host, forwardServer.Port)
+        do! client.ConnectAsync(forwardServer.Host, forwardServer.Port)
 
         use stream = client.GetStream()
         use streamWriter = new StreamWriter(stream)
@@ -216,9 +200,7 @@ let private forwardMessages forwardServer messages =
 
         for message in messages do
             match message with
-            | Received m ->
-                do!
-                    streamWriter.WriteLineAsync(m)
+            | Received m -> do! streamWriter.WriteLineAsync(m)
             | Sent m ->
                 let! x = streamReader.ReadLineAsync()
                 ()
@@ -226,7 +208,7 @@ let private forwardMessages forwardServer messages =
         client.Close()
     }
 
-let private smtpActor (cachingActor: Actor<CheckInbox>) port forwardServer (cancellation: CancellationToken) =
+let private smtpActor (cachingActor: Actor<CheckInbox>) port forwardServer =
     Actor.Start (fun _ ->
         let endPoint = new IPEndPoint(IPAddress.Any, port)
         let listener = new TcpListener(endPoint)
@@ -234,7 +216,7 @@ let private smtpActor (cachingActor: Actor<CheckInbox>) port forwardServer (canc
 
         let rec loop () =
             async {
-                let! emailResult = receiveEmails listener cancellation
+                let! emailResult = receiveEmails listener
 
                 match emailResult with
                 | Result.Error _ -> listener.Stop()
@@ -245,9 +227,6 @@ let private smtpActor (cachingActor: Actor<CheckInbox>) port forwardServer (canc
                     | Some config -> do! forwardMessages config recorded |> Async.AwaitTask
                     | _ -> ()
 
-                if cancellation.IsCancellationRequested then
-                    listener.Stop()
-                else
                     return! loop ()
             }
 
@@ -277,7 +256,6 @@ let public NoForwardServer = { Port = -1; Host = "" }
 
 
 type public Server(port, thruServer) =
-    let cancellationSource = new CancellationTokenSource()
     let emailReceivedEvent = new Subject<Email>()
     let cache = cachingActor emailReceivedEvent.OnNext
 
@@ -289,16 +267,9 @@ type public Server(port, thruServer) =
                  None
              else
                  Some thruServer)
-            cancellationSource.Token
 
     new(port) = new Server(port, NoForwardServer)
     new() = new Server(25, NoForwardServer)
-
-    interface IDisposable with
-        member x.Dispose() =
-            cancellationSource.Cancel(false)
-            cancellationSource.Dispose()
-
 
     member this.GetEmails() = cache.PostAndReply Get
     member this.GetEmailsAndReset() = cache.PostAndReply GetAndReset
